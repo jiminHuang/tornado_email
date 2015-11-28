@@ -11,6 +11,7 @@ from tornado import iostream, gen
 import socket
 import smtplib
 import logging
+import re
 from email.base64mime import body_encode
 
 CRLF = b'\r\n'
@@ -178,20 +179,51 @@ class AsyncSMTP(object):
             raise smtplib.SMTPSenderRefused(code, responses, from_addr)
         raise gen.Return((code, responses))
 
+    @gen.coroutine
+    def rcpt(self, to_addr, options):
+        '''
+            一个异步的rcpt命令，发送rcpt TO 收件者地址
+        '''
+        # 构造rcpt命令
+        rcpt_str = 'rcpt TO:{0} {1}'.format(
+            smtplib.quoteaddr(to_addr),
+            b' '.join(options),
+        ).strip().encode('ascii')
+
+        logging.error(rcpt_str)
+
+        code, responses = yield self.send(rcpt_str)
+
+        if code != '250' and code != '251':
+            if code == '421':
+                self.close()
+            else:
+                yield self.rset()
+            raise smtplib.SMTPSenderRefused(code, responses, to_addr)
+        raise gen.Return((code, responses))
+
+    def _fix_eols(self, data):
+        '''
+            PYTHON3 smtplib有这个方法转义数据 这里只是简单复制过来
+        '''
+        return re.sub(r'(?:\r\n|\n|\r(?!\n))', CRLF, data)
+
     def close(self):
         self.stream.close()
         self.stream = None
 
     @gen.coroutine
-    def sendmail(self, from_addr, to_addrs, msg, mail_options=[],
-                 rcpt_options=[]):
+    def send_mail(
+            self, from_addr, to_addrs, msg, mail_options=[],
+            rcpt_options=[]
+            ):
         # ehlo操作是必须的
         if not self.if_ever_ehlo:
             yield self.ehlo()
 
         # msg编码
         if isinstance(msg, basestring):
-            msg = smtplib._fix_eols(msg).encode('ascii')
+            msg = self._fix_eols(msg).encode('ascii')
 
         # 如果feature中有size，options必须附加当前邮件大小
         if 'size' in self.esmtp_features:
@@ -202,3 +234,6 @@ class AsyncSMTP(object):
 
         # to_addrs 单str 要转换成list 方便后面处理
         to_addrs = [to_addrs] if isinstance(to_addrs, basestring) else to_addrs
+
+        for to_addr in to_addrs:
+            code, responses = yield self.rcpt(to_addr, rcpt_options)
