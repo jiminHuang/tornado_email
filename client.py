@@ -202,6 +202,30 @@ class AsyncSMTP(object):
             raise smtplib.SMTPSenderRefused(code, responses, to_addr)
         raise gen.Return((code, responses))
 
+    @gen.coroutine
+    def data(self, data):
+        '''
+            一个异步的data命令，发送data [ascii编码的data] CRLF . CRLF
+        '''
+        code, responses = yield self.send('data')
+
+        if code != '354':
+            raise smtplib.SMTPDataError(code, responses)
+        else:
+            if data[-2:] != CRLF:
+                data = data + CRLF
+            data = data + b'.' + CRLF
+            yield self.send(data)
+            code, responses = yield self.receive()
+            if code != '250':
+                if code == '421':
+                    self.close()
+                else:
+                    yield self._rset()
+                raise smtplib.SMTPDataError(code, responses)
+            raise gen.Return((code, responses))
+
+
     def _fix_eols(self, data):
         '''
             PYTHON3 smtplib有这个方法转义数据 这里只是简单复制过来
@@ -223,7 +247,8 @@ class AsyncSMTP(object):
 
         # msg编码
         if isinstance(msg, basestring):
-            msg = self._fix_eols(msg).encode('ascii')
+            #msg = self._fix_eols(msg).encode('ascii')
+            msg = smtplib.quotedata(msg).encode('ascii')
 
         # 如果feature中有size，options必须附加当前邮件大小
         if 'size' in self.esmtp_features:
@@ -237,3 +262,5 @@ class AsyncSMTP(object):
 
         for to_addr in to_addrs:
             code, responses = yield self.rcpt(to_addr, rcpt_options)
+
+        code, responses = yield self.data(msg)
