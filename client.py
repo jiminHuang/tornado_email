@@ -21,10 +21,11 @@ def _get_hostname():
     fqdn = socket.getfqdn()
     if '.' not in fqdn:
         try:
-            fqdn = socket.gethostbyname(fqdn)
+            addr = socket.gethostbyname(socket.gethostname())
         except socket.gaierror:
-            pass
-        return bytes('[{fqdn}]'.format(fqdn=fqdn))
+            addr = '127.0.0.1'
+
+        return bytes('[{fqdn}]'.format(fqdn=addr))
     return bytes(fqdn)
 
 
@@ -41,6 +42,7 @@ class AsyncSMTP(object):
         '''
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         self.stream = iostream.IOStream(sock)
+        self.host = host
         stream = yield self.stream.connect((host, port))
         raise gen.Return(stream)
 
@@ -49,9 +51,9 @@ class AsyncSMTP(object):
         '''
             一个异步方法，构造并写入信息
         '''
-        logging.info('send: {0}'.format(msg))
         # 信息尾部加入CRLF 否则远程服务器会一直等待发送结束
         msg = b''.join((msg, CRLF))
+        logging.info(repr('send: {0}'.format(msg)))
         yield self.stream.write(msg)
         code, response = yield self.receive()
         raise gen.Return((code, response))
@@ -65,13 +67,14 @@ class AsyncSMTP(object):
         logging.info('received: ')
         while True:
             # 不停的接收CRLF之前的数据直到空行或者code异常
+            response = ''
             try:
                 response = yield self.stream.read_until(CRLF)
             except socket.error, e:
                 logging.exception(e)
                 response = 'failed'
             finally:
-                logging.info(response.strip())
+                logging.info(repr(response))
 
             code = str(response[0:3])
 
@@ -105,7 +108,7 @@ class AsyncSMTP(object):
         # 必须要以ehlo 主机名的形式发送 确认自己身份
         # 主机名必须在DNS上有记录 否则发不出去
         hostname = _get_hostname()
-        code, responses = yield self.send('ehlo [{0}]'.format(hostname))
+        code, responses = yield self.send('ehlo {0}'.format(hostname))
         self.if_ever_ehlo = True
 
         # 简单的假设smtp邮件服务器支持auth login plain
@@ -149,6 +152,24 @@ class AsyncSMTP(object):
             raise smtplib.SMTPAuthenticationError(code, responses)
 
     @gen.coroutine
+    def start_tls(self):
+        if not self.if_ever_ehlo:
+            yield self.ehlo()
+        code, responses = yield self.send('STARTTLS')
+
+        if code == '220':
+            server_hostname = self.host
+            self.stream =\
+                yield self.stream.start_tls(
+                    False,
+                    server_hostname=server_hostname
+                )
+            self.if_ever_ehlo = False
+            self.esmtp_features = {}
+
+        raise gen.Return((code, responses))
+
+    @gen.coroutine
     def rset(self):
         '''
             一个异步的rset命令，重置连接session
@@ -190,8 +211,6 @@ class AsyncSMTP(object):
             b' '.join(options),
         ).strip().encode('ascii')
 
-        logging.error(rcpt_str)
-
         code, responses = yield self.send(rcpt_str)
 
         if code != '250' and code != '251':
@@ -201,6 +220,14 @@ class AsyncSMTP(object):
                 yield self.rset()
             raise smtplib.SMTPSenderRefused(code, responses, to_addr)
         raise gen.Return((code, responses))
+
+    def quotedata(self, data):
+        '''
+            bytes下data转义
+        '''
+        return re.sub(
+            r'(?m)^\.', b'..',
+            re.sub(r'(?:\r\n|\n|\r(?!\n))', CRLF, data))
 
     @gen.coroutine
     def data(self, data):
@@ -214,23 +241,21 @@ class AsyncSMTP(object):
         else:
             if data[-2:] != CRLF:
                 data = data + CRLF
-            data = data + b'.' + CRLF
-            yield self.send(data)
-            code, responses = yield self.receive()
+            data = data + b'.'
+            code, responses = yield self.send(data)
             if code != '250':
                 if code == '421':
                     self.close()
                 else:
-                    yield self._rset()
+                    yield self.rset()
                 raise smtplib.SMTPDataError(code, responses)
             raise gen.Return((code, responses))
 
-
-    def _fix_eols(self, data):
-        '''
-            PYTHON3 smtplib有这个方法转义数据 这里只是简单复制过来
-        '''
-        return re.sub(r'(?:\r\n|\n|\r(?!\n))', CRLF, data)
+    @gen.coroutine
+    def quit(self):
+        logging.error('quit')
+        yield self.send('quit')
+        self.close()
 
     def close(self):
         self.stream.close()
@@ -247,8 +272,7 @@ class AsyncSMTP(object):
 
         # msg编码
         if isinstance(msg, basestring):
-            #msg = self._fix_eols(msg).encode('ascii')
-            msg = smtplib.quotedata(msg).encode('ascii')
+            msg = self.quotedata(msg).encode('ascii')
 
         # 如果feature中有size，options必须附加当前邮件大小
         if 'size' in self.esmtp_features:
