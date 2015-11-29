@@ -272,7 +272,7 @@ class AsyncSMTP(object):
 
         # msg编码
         if isinstance(msg, basestring):
-            msg = self.quotedata(msg).encode('ascii')
+            msg = self.quotedata(msg).encode('utf8')
 
         # 如果feature中有size，options必须附加当前邮件大小
         if 'size' in self.esmtp_features:
