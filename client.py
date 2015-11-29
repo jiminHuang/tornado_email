@@ -253,7 +253,6 @@ class AsyncSMTP(object):
 
     @gen.coroutine
     def quit(self):
-        logging.error('quit')
         yield self.send('quit')
         self.close()
 
